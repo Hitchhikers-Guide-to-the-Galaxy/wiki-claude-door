@@ -1,0 +1,45 @@
+{
+  "name": "@fortyfoxes/wiki-claude-door",
+  "version": "0.1.0",
+  "description": "The Claude door for federated wiki farm plugins: one question to a model — the Claude API where the farm holds a key, the Claude Code CLI under whoever is logged in (a Claude Max account) where it does not, or an Ollama model found by DNS-SD — shared by wiki-plugin-audionote and wiki-plugin-plan",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./discover": "./discover.js"
+  },
+  "files": [
+    "index.js",
+    "discover.js",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "keywords": [
+    "claude",
+    "claude code",
+    "ollama",
+    "wiki",
+    "federated wiki"
+  ],
+  "author": "David Bovill",
+  "license": "MIT",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.127.0"
+  },
+  "engines": {
+    "node": ">=22.12"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Hitchhikers-Guide-to-the-Galaxy/wiki-claude-door.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Hitchhikers-Guide-to-the-Galaxy/wiki-claude-door/issues"
+  },
+  "homepage": "https://github.com/Hitchhikers-Guide-to-the-Galaxy/wiki-claude-door#readme",
+  "publishConfig": {
+    "access": "public"
+  }
+}
