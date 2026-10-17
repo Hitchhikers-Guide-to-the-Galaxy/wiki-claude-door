@@ -190,3 +190,8 @@ test('toolArgs: research tools only, offered and approved, the rest disallowed',
   await assert.rejects(ask('claude-opus-5-5', 'q', { tools: ['Write'] }), e => e.status === 500)
   clean()
 })
+
+test('openai: model ids are accepted (0.2.0)', () => {
+  assert.ok(isModelId('openai:llm_auto-big'))
+  assert.ok(!isModelId('openai:'))
+})

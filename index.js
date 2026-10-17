@@ -11,6 +11,10 @@
 //                        as whoever is logged in on the farm's machine — a
 //                        Claude Max account, no API key
 //   ollama:name          an Ollama model, its URL found through DNS-SD
+//   openai:name          (0.2.0) a model behind an OpenAI-compatible
+//                        /v1/chat/completions, its URL found through DNS-SD
+//                        (default coop._openai._tcp.names.private.fish: the
+//                        LLM coop's GPU machine on the tailnet, 17 Oct 2026)
 //
 // The door runs wherever the handler runs: on the laptop the CLI is signed in
 // to David's Max account; on a headless farm (the Pi5) it reads a long-lived
@@ -23,6 +27,8 @@
 //   CLAUDE_DOOR_FALLBACK_MODEL  AUDIONOTE_FALLBACK_MODEL     tried when the first is unreachable
 //   CLAUDE_DOOR_OLLAMA_URL      AUDIONOTE_OLLAMA_URL         a URL or dnssd:… spec
 //   CLAUDE_DOOR_OLLAMA_FALLBACK AUDIONOTE_OLLAMA_FALLBACK    when DNS-SD fails
+//   CLAUDE_DOOR_OPENAI_URL      (0.2.0)                      a URL or dnssd:… spec for openai:
+//   CLAUDE_DOOR_OPENAI_FALLBACK (0.2.0)                      when DNS-SD fails
 //   CLAUDE_DOOR_TOKEN_FILE      AUDIONOTE_CLAUDE_TOKEN_FILE  the CLI's OAuth token file
 //   CLAUDE_DOOR_BIN             AUDIONOTE_CLAUDE_BIN         the claude executable
 //   CLAUDE_DOOR_KEY_FILE        (new)                        the API key file
@@ -50,7 +56,7 @@ const unreachable = (status, message) => problem(status, message, { unreachable:
 // ---------- which model ----------
 
 /** A model id a caller may name: the test the Voice Tool applies to a prompt's MODEL line. */
-export const MODEL_ID = /^(claude-[a-z0-9-]+|claude-cli:claude-[a-z0-9-]+|ollama:[\w.:/-]+)$/
+export const MODEL_ID = /^(claude-[a-z0-9-]+|claude-cli:claude-[a-z0-9-]+|ollama:[\w.:/-]+|openai:[\w.:/-]+)$/
 export const isModelId = model => typeof model === 'string' && MODEL_ID.test(model)
 
 /**
@@ -157,11 +163,12 @@ export const askClaude = async (model, content, { system = '', timeoutMs = DEFAU
 
 export const askOllama = async (model, content, { system = '', timeoutMs = 10 * 60 * 1000 } = {}) => {
   const name = model.slice('ollama:'.length)
-  const spec = setting(['CLAUDE_DOOR_OLLAMA_URL', 'AUDIONOTE_OLLAMA_URL'], 'http://127.0.0.1:11434')
+  // found by name (qwen lives on the MacMini, never hard-coded), localhost when DNS-SD fails (0.2.0)
+  const spec = setting(['CLAUDE_DOOR_OLLAMA_URL', 'AUDIONOTE_OLLAMA_URL'], 'dnssd:qwen._ollama._tcp.names.private.fish')
   let url = spec
   let res
   try {
-    url = await discover.resolve(spec, setting(['CLAUDE_DOOR_OLLAMA_FALLBACK', 'AUDIONOTE_OLLAMA_FALLBACK'], ''))
+    url = await discover.resolve(spec, setting(['CLAUDE_DOOR_OLLAMA_FALLBACK', 'AUDIONOTE_OLLAMA_FALLBACK'], 'http://127.0.0.1:11434'))
     const messages = [...(system ? [{ role: 'system', content: system }] : []), { role: 'user', content }]
     res = await fetch(`${url}/api/chat`, {
       method: 'POST',
@@ -179,6 +186,46 @@ export const askOllama = async (model, content, { system = '', timeoutMs = 10 * 
   // is whatever follows the last </think>.
   const markdown = String(body.message?.content || '').split('</think>').pop().trim()
   return { markdown, model, stop: body.done_reason, usage: { input: body.prompt_eval_count, output: body.eval_count } }
+}
+
+// ---------- an OpenAI-compatible endpoint (0.2.0) ----------
+//
+// The LLM coop's machine (llama-swap in front of vLLM) and anything like it.
+// Reasoning models (glm-5.3-flash behind llm_auto-big) think first, into
+// message.reasoning: with a small max_tokens the answer comes back empty, and
+// switching thinking off makes glm write its reasoning INTO the answer
+// (measured 17 Oct 2026) — so thinking stays on and the budget is large.
+
+export const askOpenAI = async (model, content, { system = '', timeoutMs = 10 * 60 * 1000 } = {}) => {
+  const name = model.slice('openai:'.length)
+  const spec = setting(['CLAUDE_DOOR_OPENAI_URL'], 'dnssd:coop._openai._tcp.names.private.fish')
+  let url = spec
+  let res
+  try {
+    url = (await discover.resolve(spec, setting(['CLAUDE_DOOR_OPENAI_FALLBACK'], ''))).replace(/\/v1$/, '')
+    const messages = [...(system ? [{ role: 'system', content: system }] : []), { role: 'user', content }]
+    res = await fetch(`${url}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: name, messages, temperature: 0.2, max_tokens: 8000 }),
+      signal: AbortSignal.timeout(timeoutMs),
+    })
+  } catch (e) {
+    throw unreachable(502, `the model at ${url} could not be reached: ${e.message}`)
+  }
+  if (!res.ok) {
+    throw Object.assign(problem(502, `${url} answered ${res.status}: ${(await res.text()).slice(0, 200)}`), { unreachable: res.status >= 500 || res.status === 404 })
+  }
+  const body = await res.json()
+  const choice = body.choices?.[0] || {}
+  const markdown = String(choice.message?.content || '').split('</think>').pop().trim()
+  if (!markdown) throw unreachable(502, `${name} gave no answer (${choice.finish_reason || 'empty'})`)
+  return {
+    markdown,
+    model: `openai:${body.model || name}`,
+    stop: choice.finish_reason,
+    usage: { input: body.usage?.prompt_tokens, output: body.usage?.completion_tokens, reasoning: body.usage?.completion_tokens_details?.reasoning_tokens },
+  }
 }
 
 // ---------- the CLI's own scope (0.1.1) ----------
@@ -317,6 +364,8 @@ export const ask = async (model, content, opts = {}) => {
   const t0 = Date.now()
   const out = how.startsWith('ollama:')
     ? await askOllama(how, content, opts)
+    : how.startsWith('openai:')
+      ? await askOpenAI(how, content, opts)
     : how.startsWith('claude-cli:')
       ? await askClaudeCli(how, content, opts)
       : await askClaude(how, content, opts)
