@@ -219,12 +219,32 @@ export const scopeArgs = ({ setting: want = '', platform = process.platform, und
 export const NO_TOOLS = 'Bash,Read,Write,Edit,Glob,Grep,WebSearch,WebFetch,Task,Agent,NotebookEdit'
 
 /**
+ * The tools a question may be given (0.1.2): reading the web, nothing that
+ * runs a command or touches a file. A caller asks for some of these with
+ * `tools`; the CLI is then offered exactly those (--tools), they are
+ * approved for a headless run (--allowedTools), and every other tool stays
+ * disallowed.
+ */
+export const RESEARCH_TOOLS = ['WebSearch', 'WebFetch']
+
+export const toolArgs = ({ tools = null, allowTools = false } = {}) => {
+  if (Array.isArray(tools) && tools.length) {
+    const bad = tools.filter(t => !RESEARCH_TOOLS.includes(t))
+    if (bad.length) throw problem(500, `the door gives a model only ${RESEARCH_TOOLS.join(' and ')}, not ${bad.join(', ')}`)
+    const list = tools.join(',')
+    const rest = NO_TOOLS.split(',').filter(t => !tools.includes(t)).join(',')
+    return ['--tools', list, '--allowedTools', list, '--disallowedTools', rest]
+  }
+  return allowTools ? [] : ['--disallowedTools', NO_TOOLS]
+}
+
+/**
  * Claude through the Claude Code CLI in headless mode (`claude -p`), the house
  * pattern, as in wiki-gmap-name. CLAUDECODE is dropped so a farm started from
  * inside a Claude session does not look like a nested one. The content goes in
  * on stdin; the answer is stdout.
  */
-export const askClaudeCli = (model, content, { system = '', timeoutMs = DEFAULT_TIMEOUT_MS, allowTools = false } = {}) =>
+export const askClaudeCli = (model, content, { system = '', timeoutMs = DEFAULT_TIMEOUT_MS, allowTools = false, tools = null } = {}) =>
   new Promise((resolve, reject) => {
     const name = model.slice('claude-cli:'.length)
     const env = { ...process.env }
@@ -233,7 +253,11 @@ export const askClaudeCli = (model, content, { system = '', timeoutMs = DEFAULT_
     if (token) env.CLAUDE_CODE_OAUTH_TOKEN = token
     const bin = setting(['CLAUDE_DOOR_BIN', 'AUDIONOTE_CLAUDE_BIN'], 'claude')
     const args = ['-p', '--model', name]
-    if (!allowTools) args.push('--disallowedTools', NO_TOOLS)
+    try {
+      args.push(...toolArgs({ tools, allowTools }))
+    } catch (e) {
+      return reject(e)
+    }
     if (system) args.push('--append-system-prompt', system)
     let scope
     try {
@@ -284,7 +308,9 @@ export const askClaudeCli = (model, content, { system = '', timeoutMs = DEFAULT_
  * Ask one question. `model` is any MODEL_ID; a bare claude-… goes through
  * door() first. Answers {markdown, model, stop, usage, ms}; a failure throws
  * an Error with a status, and `unreachable` set when another model might do.
- * allowTools applies to the CLI only, and is off unless asked for.
+ * allowTools applies to the CLI only, and is off unless asked for; tools
+ * (0.1.2) gives the CLI some of RESEARCH_TOOLS and nothing else. The API road
+ * has no tools: a question that needs them goes by the CLI.
  */
 export const ask = async (model, content, opts = {}) => {
   const how = door(model)

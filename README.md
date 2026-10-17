@@ -38,13 +38,17 @@ Read when a question is asked. Each `CLAUDE_DOOR_*` name falls back to the `AUDI
 
 `ANTHROPIC_API_KEY`, when set, is the API key.
 
+## Research tools
+
+Since 0.1.2 a caller may pass `tools: ['WebSearch', 'WebFetch']` (or one of them) to `ask`. The CLI is then offered exactly those tools and they are approved for a headless run; every other tool stays disallowed. Nothing that runs a command or touches a file can be asked for. The API road has no tools, so a question that needs them should name a `claude-cli:` model.
+
 ## The CLI's own scope
 
 Since 0.1.1, on a farm run by systemd (the Pi5), `claude -p` starts through `systemd-run --user --scope` with its own `MemoryMax` and `MemorySwapMax=0`. Without that, the CLI was a child of the wiki farm and counted against the farm's own memory cap. A farm close to its cap plus a CLI of a few hundred MB meant the kernel killed the whole farm for being out of memory (OOM), not just the one question. In its own scope, a CLI that grows too big is killed alone, and the question fails with a 502 that says so.
 
 ## Status
 
-0.1.1, ESM, Node 22.12 or later (CommonJS callers `require()` it). Installed beside its callers as `"@fortyfoxes/wiki-claude-door": "file:../wiki-claude-door"`; Phase 6 of the Plan Tool Plan publishes it to npm, after which the callers depend on the published version.
+0.1.2, ESM, Node 22.12 or later (CommonJS callers `require()` it). Installed beside its callers as `"@fortyfoxes/wiki-claude-door": "file:../wiki-claude-door"`; Phase 6 of the Plan Tool Plan publishes it to npm, after which the callers depend on the published version.
 
 `npm test` runs the tests: filling, routing, settings, DNS-SD parsing, and the CLI road against a stand-in `claude`.
 

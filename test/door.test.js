@@ -7,7 +7,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
-import { fill, door, defaultModel, fallbackModel, isModelId, ask, NO_TOOLS, discover, scopeArgs, SCOPE_DEFAULT } from '../index.js'
+import { fill, door, defaultModel, fallbackModel, isModelId, ask, NO_TOOLS, discover, scopeArgs, SCOPE_DEFAULT, toolArgs } from '../index.js'
 
 const scratch = () => fs.mkdtempSync(path.join(os.tmpdir(), 'door-test-'))
 const clean = () => {
@@ -169,5 +169,24 @@ test('ask: a scope that cannot start, and a CLI killed in its scope, are unreach
   fs.writeFileSync(killed, '#!/bin/sh\nkill -9 $$\n', { mode: 0o755 })
   process.env.CLAUDE_DOOR_SYSTEMD_RUN = killed
   await assert.rejects(ask('claude-opus-5-5', 'q'), e => e.unreachable && /was killed in its own scope \(MemoryMax=600M, no swap\): it went over its memory cap/.test(e.message))
+  clean()
+})
+
+test('toolArgs: research tools only, offered and approved, the rest disallowed', async () => {
+  assert.deepEqual(toolArgs(), ['--disallowedTools', NO_TOOLS])
+  assert.deepEqual(toolArgs({ allowTools: true }), [])
+  const a = toolArgs({ tools: ['WebSearch', 'WebFetch'] })
+  assert.deepEqual(a.slice(0, 4), ['--tools', 'WebSearch,WebFetch', '--allowedTools', 'WebSearch,WebFetch'])
+  assert.equal(a[4], '--disallowedTools')
+  assert.ok(!a[5].includes('WebSearch') && a[5].includes('Bash') && a[5].includes('Write'))
+  assert.throws(() => toolArgs({ tools: ['Bash'] }), /only WebSearch and WebFetch/)
+  clean()
+  const dir = scratch()
+  process.env.CLAUDE_DOOR_KEY_FILE = path.join(dir, 'no-key')
+  process.env.CLAUDE_DOOR_BIN = fakeClaude(dir)
+  process.env.CLAUDE_DOOR_SCOPE_MEMORY = 'off'
+  const out = await ask('claude-opus-5-5', 'q', { tools: ['WebSearch', 'WebFetch'] })
+  assert.match(out.markdown, /--tools WebSearch,WebFetch --allowedTools WebSearch,WebFetch --disallowedTools Bash,/)
+  await assert.rejects(ask('claude-opus-5-5', 'q', { tools: ['Write'] }), e => e.status === 500)
   clean()
 })
