@@ -33,12 +33,18 @@ Read when a question is asked. Each `CLAUDE_DOOR_*` name falls back to the `AUDI
 | CLAUDE_DOOR_TOKEN_FILE | AUDIONOTE_CLAUDE_TOKEN_FILE | the CLI token, default ~/.config/voice/claude-token |
 | CLAUDE_DOOR_BIN | AUDIONOTE_CLAUDE_BIN | the claude executable |
 | CLAUDE_DOOR_KEY_FILE | | the API key file, default ~/.config/voice/anthropic-key |
+| CLAUDE_DOOR_SCOPE_MEMORY | | the CLI's own memory cap: unset means 1G under a systemd unit on Linux and none elsewhere; a size such as 800M means always; off means never |
+| CLAUDE_DOOR_SYSTEMD_RUN | | the systemd-run executable |
 
 `ANTHROPIC_API_KEY`, when set, is the API key.
 
+## The CLI's own scope
+
+Since 0.1.1, on a farm run by systemd (the Pi5), `claude -p` starts through `systemd-run --user --scope` with its own `MemoryMax` and `MemorySwapMax=0`. Without that, the CLI was a child of the wiki farm and counted against the farm's own memory cap. A farm close to its cap plus a CLI of a few hundred MB meant the kernel killed the whole farm for being out of memory (OOM), not just the one question. In its own scope, a CLI that grows too big is killed alone, and the question fails with a 502 that says so.
+
 ## Status
 
-0.1.0, ESM, Node 22.12 or later (CommonJS callers `require()` it). Installed beside its callers as `"@fortyfoxes/wiki-claude-door": "file:../wiki-claude-door"`; Phase 6 of the Plan Tool Plan publishes it to npm, after which the callers depend on the published version.
+0.1.1, ESM, Node 22.12 or later (CommonJS callers `require()` it). Installed beside its callers as `"@fortyfoxes/wiki-claude-door": "file:../wiki-claude-door"`; Phase 6 of the Plan Tool Plan publishes it to npm, after which the callers depend on the published version.
 
 `npm test` runs the tests: filling, routing, settings, DNS-SD parsing, and the CLI road against a stand-in `claude`.
 

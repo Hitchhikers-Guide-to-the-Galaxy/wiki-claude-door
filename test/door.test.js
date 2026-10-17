@@ -7,7 +7,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
-import { fill, door, defaultModel, fallbackModel, isModelId, ask, NO_TOOLS, discover } from '../index.js'
+import { fill, door, defaultModel, fallbackModel, isModelId, ask, NO_TOOLS, discover, scopeArgs, SCOPE_DEFAULT } from '../index.js'
 
 const scratch = () => fs.mkdtempSync(path.join(os.tmpdir(), 'door-test-'))
 const clean = () => {
@@ -111,5 +111,63 @@ test('ask: a CLI that cannot start is unreachable; one that overruns is stopped'
   fs.writeFileSync(slow, '#!/bin/sh\nexec sleep 5\n', { mode: 0o755 })
   process.env.CLAUDE_DOOR_BIN = slow
   await assert.rejects(ask('claude-opus-5-5', 'q', { timeoutMs: 300 }), e => e.status === 504)
+  clean()
+})
+
+test('scopeArgs: a scope under systemd on Linux by default, a set size always, off never', () => {
+  assert.equal(scopeArgs({ platform: 'darwin', underSystemd: false }), null, 'a laptop: no scope')
+  assert.equal(scopeArgs({ platform: 'linux', underSystemd: false }), null, 'a shell on the Pi: no scope')
+  const auto = scopeArgs({ platform: 'linux', underSystemd: true })
+  assert.equal(auto.cap, SCOPE_DEFAULT)
+  assert.deepEqual(auto.args, ['--user', '--scope', '--quiet', '--collect', '-p', `MemoryMax=${SCOPE_DEFAULT}`, '-p', 'MemorySwapMax=0', '--'])
+  assert.equal(scopeArgs({ setting: '800M', platform: 'darwin', underSystemd: false }).cap, '800M')
+  assert.equal(scopeArgs({ setting: 'off', platform: 'linux', underSystemd: true }), null)
+  assert.ok(scopeArgs({ setting: '1G', unit: 'claude-door-1' }).args.includes('--unit=claude-door-1'))
+  assert.throws(() => scopeArgs({ setting: 'lots' }), /must be a size/)
+})
+
+// A stand-in systemd-run: logs its own words, then execs the command after --.
+const fakeRun = dir => {
+  const bin = path.join(dir, 'systemd-run')
+  fs.writeFileSync(bin, `#!/bin/sh\nwhile [ "$1" != "--" ]; do echo "$1" >> "${dir}/scope.log"; shift; done\nshift\nexec "$@"\n`, { mode: 0o755 })
+  return bin
+}
+
+test('ask: the CLI road in its own scope — systemd-run carries the cap, the answer is unchanged', async () => {
+  clean()
+  const dir = scratch()
+  process.env.CLAUDE_DOOR_KEY_FILE = path.join(dir, 'no-key')
+  process.env.CLAUDE_DOOR_BIN = fakeClaude(dir)
+  process.env.CLAUDE_DOOR_SYSTEMD_RUN = fakeRun(dir)
+  process.env.CLAUDE_DOOR_SCOPE_MEMORY = '600M'
+  const out = await ask('claude-opus-5-5', 'scoped question')
+  assert.match(out.markdown, /^ARGS -p --model claude-opus-5-5 /)
+  assert.ok(out.markdown.endsWith('scoped question'))
+  const log = fs.readFileSync(path.join(dir, 'scope.log'), 'utf8')
+  assert.match(log, /--scope/)
+  assert.match(log, /MemoryMax=600M/)
+  assert.match(log, /MemorySwapMax=0/)
+  assert.match(log, /--unit=claude-door-\d+-/)
+  process.env.CLAUDE_DOOR_SCOPE_MEMORY = 'off'
+  fs.rmSync(path.join(dir, 'scope.log'))
+  await ask('claude-opus-5-5', 'q')
+  assert.ok(!fs.existsSync(path.join(dir, 'scope.log')), 'off: no systemd-run')
+  clean()
+})
+
+test('ask: a scope that cannot start, and a CLI killed in its scope, are unreachable with the reason', async () => {
+  clean()
+  const dir = scratch()
+  process.env.CLAUDE_DOOR_KEY_FILE = path.join(dir, 'no-key')
+  process.env.CLAUDE_DOOR_BIN = fakeClaude(dir)
+  process.env.CLAUDE_DOOR_SCOPE_MEMORY = '600M'
+  const noBus = path.join(dir, 'nobus')
+  fs.writeFileSync(noBus, '#!/bin/sh\necho "Failed to connect to bus: No medium found" >&2\nexit 1\n', { mode: 0o755 })
+  process.env.CLAUDE_DOOR_SYSTEMD_RUN = noBus
+  await assert.rejects(ask('claude-opus-5-5', 'q'), e => e.unreachable && e.status === 502 && /own scope: Failed to connect to bus/.test(e.message) && /SCOPE_MEMORY=off/.test(e.message))
+  const killed = path.join(dir, 'killed')
+  fs.writeFileSync(killed, '#!/bin/sh\nkill -9 $$\n', { mode: 0o755 })
+  process.env.CLAUDE_DOOR_SYSTEMD_RUN = killed
+  await assert.rejects(ask('claude-opus-5-5', 'q'), e => e.unreachable && /was killed in its own scope \(MemoryMax=600M, no swap\): it went over its memory cap/.test(e.message))
   clean()
 })

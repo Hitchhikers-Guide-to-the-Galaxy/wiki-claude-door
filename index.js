@@ -26,6 +26,8 @@
 //   CLAUDE_DOOR_TOKEN_FILE      AUDIONOTE_CLAUDE_TOKEN_FILE  the CLI's OAuth token file
 //   CLAUDE_DOOR_BIN             AUDIONOTE_CLAUDE_BIN         the claude executable
 //   CLAUDE_DOOR_KEY_FILE        (new)                        the API key file
+//   CLAUDE_DOOR_SCOPE_MEMORY    (0.1.1)                      the CLI's own memory cap, or off
+//   CLAUDE_DOOR_SYSTEMD_RUN     (0.1.1)                      the systemd-run executable
 // ANTHROPIC_API_KEY, when set, is the API key.
 
 import fs from 'node:fs'
@@ -179,6 +181,40 @@ export const askOllama = async (model, content, { system = '', timeoutMs = 10 * 
   return { markdown, model, stop: body.done_reason, usage: { input: body.prompt_eval_count, output: body.eval_count } }
 }
 
+// ---------- the CLI's own scope (0.1.1) ----------
+//
+// On a farm run by systemd (the Pi5), the CLI is a child of the wiki farm and
+// so counts against the farm's own memory cap: a farm near its MemoryMax plus
+// a `claude -p` of a few hundred MB is an OOM kill of the whole farm, not of
+// the one question (17 Oct 2026: the private farm at 1.78 of 2.0 GB). So
+// there the CLI runs in a transient scope of its own, `systemd-run --user
+// --scope`, with its own MemoryMax and no swap: outside the farm's cgroup, and
+// when it is too big it alone is killed and the question fails with a 502.
+//
+//   CLAUDE_DOOR_SCOPE_MEMORY  unset — a scope of SCOPE_DEFAULT when the door
+//                             runs under a systemd unit on Linux (INVOCATION_ID
+//                             is set), none elsewhere (a laptop);
+//                             a size (800M, 1G) — a scope of that size, always;
+//                             off — never a scope.
+//   CLAUDE_DOOR_SYSTEMD_RUN   the systemd-run executable, systemd-run by default.
+
+export const SCOPE_DEFAULT = '1G'
+const SIZE_RE = /^\d+(?:\.\d+)?[KMGT]?$/
+
+/**
+ * The words that put a command in its own scope, or null for none: decided
+ * from the setting, the platform and whether systemd started this process.
+ * Pure, so the rule can be tested anywhere.
+ */
+export const scopeArgs = ({ setting: want = '', platform = process.platform, underSystemd = !!process.env.INVOCATION_ID, run = 'systemd-run', unit = '' } = {}) => {
+  const v = String(want || '').trim()
+  if (/^(off|none|no|0)$/i.test(v)) return null
+  if (v && !SIZE_RE.test(v)) throw problem(500, `CLAUDE_DOOR_SCOPE_MEMORY must be a size such as 800M or 1G, or off; it is ${v}`)
+  if (!v && !(platform === 'linux' && underSystemd)) return null
+  const cap = v || SCOPE_DEFAULT
+  return { cap, run, args: ['--user', '--scope', '--quiet', '--collect', ...(unit ? [`--unit=${unit}`] : []), '-p', `MemoryMax=${cap}`, '-p', 'MemorySwapMax=0', '--'] }
+}
+
 /** Every tool the CLI has, disallowed: the content is untrusted text and this is one question, not an agent. */
 export const NO_TOOLS = 'Bash,Read,Write,Edit,Glob,Grep,WebSearch,WebFetch,Task,Agent,NotebookEdit'
 
@@ -199,7 +235,14 @@ export const askClaudeCli = (model, content, { system = '', timeoutMs = DEFAULT_
     const args = ['-p', '--model', name]
     if (!allowTools) args.push('--disallowedTools', NO_TOOLS)
     if (system) args.push('--append-system-prompt', system)
-    const child = spawn(bin, args, { env, cwd: os.tmpdir(), stdio: ['pipe', 'pipe', 'pipe'] })
+    let scope
+    try {
+      scope = scopeArgs({ setting: setting(['CLAUDE_DOOR_SCOPE_MEMORY'], ''), run: setting(['CLAUDE_DOOR_SYSTEMD_RUN'], 'systemd-run'), unit: `claude-door-${process.pid}-${Date.now().toString(36)}` })
+    } catch (e) {
+      return reject(e)
+    }
+    const child = scope ? spawn(scope.run, [...scope.args, bin, ...args], { env, cwd: os.tmpdir(), stdio: ['pipe', 'pipe', 'pipe'] }) : spawn(bin, args, { env, cwd: os.tmpdir(), stdio: ['pipe', 'pipe', 'pipe'] })
+    const where = scope ? ` in its own scope (MemoryMax=${scope.cap}, no swap)` : ''
     let out = ''
     let err = ''
     child.stdout.on('data', d => (out += d))
@@ -215,13 +258,18 @@ export const askClaudeCli = (model, content, { system = '', timeoutMs = DEFAULT_
       clearTimeout(timer)
       if (settled) return
       settled = true
-      reject(unreachable(502, `the claude CLI could not be started (${bin}): ${e.message}`))
+      reject(unreachable(502, `the claude CLI could not be started (${scope ? `${scope.run} … ${bin}` : bin}): ${e.message}`))
     })
-    child.on('close', code => {
+    child.on('close', (code, signal) => {
       clearTimeout(timer)
       if (settled) return
       settled = true
       const text = out.trim()
+      // Killed from outside: in a scope, most likely its memory cap.
+      if (signal === 'SIGKILL' || code === 137) return reject(unreachable(502, `the claude CLI was killed${where}${scope ? ': it went over its memory cap' : ''}`))
+      if (scope && code !== 0 && !text && /Failed to (start|connect|create)|transient/i.test(err)) {
+        return reject(unreachable(502, `the claude CLI could not be put in its own scope: ${err.trim().split('\n').pop().slice(0, 200)} — set CLAUDE_DOOR_SCOPE_MEMORY=off to run it without one`))
+      }
       if (code !== 0 || !text || /^Not logged in/i.test(text)) {
         const why = (text || err.trim()).split('\n').slice(-2).join(' ').slice(0, 300) || `exit ${code}`
         return reject(unreachable(502, `the claude CLI did not answer: ${why}`))
