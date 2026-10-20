@@ -34,6 +34,8 @@
 //   CLAUDE_DOOR_KEY_FILE        (new)                        the API key file
 //   CLAUDE_DOOR_SCOPE_MEMORY    (0.1.1)                      the CLI's own memory cap, or off
 //   CLAUDE_DOOR_SYSTEMD_RUN     (0.1.1)                      the systemd-run executable
+//   CLAUDE_DOOR_AUTO_BIG        (0.3.0)                      the coop model Auto's big tier asks
+//   CLAUDE_DOOR_AUTO_CAREFUL    (0.3.0)                      the Claude model Auto's careful tier asks
 // ANTHROPIC_API_KEY, when set, is the API key.
 
 import fs from 'node:fs'
@@ -468,6 +470,69 @@ export const contextOf = async model => {
     if (m) return m.contextLength || null
   }
   return null
+}
+
+// ---------- Auto: a tier to a model (0.3.0) ----------
+//
+// A caller that lets the farm choose (the Plan Tool's and the Voice Tool's
+// "auto") decides how hard its question is — a tier — and the door turns the
+// tier into a model it can reach now, one whose window holds the question
+// plus room to answer:
+//   light    a loaded coop model: no cold start, no per-use cost
+//   big      a loaded coop model with a big window (CLAUDE_DOOR_AUTO_BIG_WINDOW,
+//            default 200000), else the coop model with the largest window,
+//            cold start and all; CLAUDE_DOOR_AUTO_BIG names one to always ask.
+//            Loaded first, so a run of big and light questions (Go Ahead's
+//            pages) does not swap models on the coop's GPUs page by page
+//   careful  Claude (CLAUDE_DOOR_AUTO_CAREFUL, else claude-opus-5-5)
+// A light question with no loaded model that holds it goes big. Nothing on
+// the coop holds it, or the coop does not answer: Claude, and the reason says
+// so. Too big for every window: no model, and the reason says why.
+// Pure over listModels' answer, so the rule is tested without a network.
+
+const AUTO_ANSWER = 4096
+const AUTO_BIG_WINDOW = 200000
+export const AUTO_TIERS = ['light', 'big', 'careful']
+
+/** A model id, short, for a status line: openai:llm_glm-5.3-flash-pp → glm-5.3-flash-pp, claude-cli:claude-opus-5-5 → claude-opus-5-5. */
+export const shortModel = id => String(id || '').replace(/^(openai:llm_|openai:|ollama:|claude-cli:)/, '')
+
+/** About 34k: a token count, short. */
+export const tokensLabel = n => (n >= 1000 ? `${Math.round(n / 1000)}k` : String(n))
+
+export const autoModel = ({ tier = 'light', need = 0, doors = [], answer = AUTO_ANSWER, careful = '', big = '' } = {}) => {
+  if (!AUTO_TIERS.includes(tier)) throw problem(400, `auto tiers are ${AUTO_TIERS.join(', ')}, not ${tier}`)
+  const holds = m => !!m && !!m.contextLength && m.contextLength >= need + answer
+  const coopDoor = doors.find(d => d.door === 'openai') || { models: [], error: 'no coop door' }
+  // the selector (llm_auto-big) routes to a concrete model: name that one, so the line says which
+  const coop = coopDoor.models.filter(m => !m.selector)
+  const claudeDoor = doors.find(d => d.door === 'claude') || { models: [] }
+  const claudeId = careful || setting(['CLAUDE_DOOR_AUTO_CAREFUL'], 'claude-opus-5-5')
+  const claudeModel = claudeDoor.models.find(m => m.id === claudeId) || (claudeDoor.models.length ? { id: claudeId, contextLength: 200000 } : null)
+  const pick = (m, t, note = '') => ({ model: m.id, tier: t, asked: tier, contextLength: m.contextLength || null, loaded: m.loaded === true, note })
+
+  const toClaude = why => (holds(claudeModel) ? pick(claudeModel, 'careful', why) : { model: '', tier, asked: tier, note: `${why}, and it is too big for Claude's window as well` })
+  const bigOne = note => {
+    const want = big || setting(['CLAUDE_DOOR_AUTO_BIG'], '')
+    const named = want && coop.find(m => m.id === want)
+    if (holds(named)) return pick(named, 'big', [note, named.loaded ? '' : 'cold — it loads first'].filter(Boolean).join('; '))
+    const most = +setting(['CLAUDE_DOOR_AUTO_BIG_WINDOW'], String(AUTO_BIG_WINDOW)) || AUTO_BIG_WINDOW
+    const warm = coop.filter(m => m.loaded === true && m.contextLength >= most && holds(m)).sort((a, b) => b.contextLength - a.contextLength)
+    if (warm.length) return pick(warm[0], 'big', note)
+    const fits = coop.filter(holds).sort((a, b) => b.contextLength - a.contextLength || (b.loaded === true) - (a.loaded === true) || /vision/.test(a.id) - /vision/.test(b.id))
+    if (fits.length) return pick(fits[0], 'big', [note, fits[0].loaded ? '' : 'cold — it loads first'].filter(Boolean).join('; '))
+    if (coopDoor.error || !coop.length) return toClaude(`the coop did not answer (${coopDoor.error || 'no models'})`)
+    return toClaude('no coop model holds it')
+  }
+
+  if (tier === 'careful') {
+    if (holds(claudeModel)) return pick(claudeModel, 'careful')
+    return bigOne("too big for Claude's window")
+  }
+  if (tier === 'big') return bigOne('')
+  const warm = coop.filter(m => m.loaded === true && holds(m)).sort((a, b) => a.contextLength - b.contextLength)
+  if (warm.length) return pick(warm[0], 'light')
+  return bigOne(coop.some(m => m.loaded === true) ? 'the loaded coop model cannot hold it' : 'no coop model is loaded')
 }
 
 export { discover }

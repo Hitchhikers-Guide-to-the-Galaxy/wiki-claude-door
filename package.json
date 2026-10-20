@@ -1,6 +1,6 @@
 {
   "name": "@fortyfoxes/wiki-claude-door",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "The Claude door for federated wiki farm plugins: one question to a model — the Claude API where the farm holds a key, the Claude Code CLI under whoever is logged in (a Claude Max account) where it does not, or an Ollama model found by DNS-SD — shared by wiki-plugin-audionote and wiki-plugin-plan",
   "type": "module",
   "main": "index.js",
