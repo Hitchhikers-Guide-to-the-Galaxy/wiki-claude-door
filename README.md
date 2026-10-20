@@ -40,6 +40,7 @@ Read when a question is asked. Each `CLAUDE_DOOR_*` name falls back to the `AUDI
 | CLAUDE_DOOR_OLLAMA_NUM_CTX | | the largest context an Ollama question is given, default 32768 |
 | CLAUDE_DOOR_AUTO_LIGHT | | (0.4.0) the coop model Auto's light tier asks, default `openai:llm_auto-big` |
 | CLAUDE_DOOR_AUTO_BIG | | (0.4.0) the Claude model Auto's big tier asks, default `claude-fable-5-1` |
+| CLAUDE_DOOR_CLASSIFIER | | (0.5.0) the coop model the classifier call asks, which must be loaded; default the router's loaded target; `off` makes no call |
 
 `ANTHROPIC_API_KEY`, when set, is the API key.
 
@@ -67,6 +68,10 @@ Since 0.1.1, on a farm run by systemd (the Pi5), `claude -p` starts through `sys
 
 0.4.0, ESM, Node 22.12 or later (CommonJS callers `require()` it). Installed beside its callers as `"@fortyfoxes/wiki-claude-door": "file:../wiki-claude-door"`; Phase 6 of the Plan Tool Plan publishes it to npm, after which the callers depend on the published version.
 
-`npm test` runs the tests: filling, routing, settings, DNS-SD parsing, and the CLI road against a stand-in `claude`, and Auto's tiers (test/auto.test.js).
+## The classifier call (0.5.0)
+
+`classifyTier({ summary, doors, model, timeoutMs, maxTokens })` reads a short summary of a run — its kind, its measures, the questions going in, the plan's opening — on a coop model that is already loaded, and answers `{ tier: 'light' | 'big', reason, model, ms, usage }` before the real call. Its tokens are spent on the coop. It never cold-starts a model: `classifierModel(doors)` is the named `CLAUDE_DOOR_CLASSIFIER` if loaded, else the router's loaded target, else any loaded text model, a plain one before a reasoning one; none loaded, the coop down, a timeout (20 s) or an answer that is neither word, and it returns `{ tier: null, skipped }` saying why, so the caller's deterministic rule stands. `CLAUDE_DOOR_CLASSIFIER=off` makes no call. `parseTier(text)` reads the one line (`big: five answers and a whole site`), past a reasoning model's thinking. `CLASSIFIER_SYSTEM` is the rubric. The Plan Tool (wiki-plugin-plan 0.13.0) calls it from autoPick with a summary it builds, and records what the rule and the classifier each said.
+
+`npm test` runs the tests: filling, routing, settings, DNS-SD parsing, and the CLI road against a stand-in `claude`, and Auto's tiers (test/auto.test.js) and the classifier call (test/classifier.test.js).
 
 MIT, David Bovill.

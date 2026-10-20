@@ -36,6 +36,7 @@
 //   CLAUDE_DOOR_SYSTEMD_RUN     (0.1.1)                      the systemd-run executable
 //   CLAUDE_DOOR_AUTO_LIGHT      (0.4.0)                      the coop model Auto's light tier asks, default openai:llm_auto-big
 //   CLAUDE_DOOR_AUTO_BIG        (0.4.0)                      the Claude model Auto's big tier asks, default claude-fable-5-1
+//   CLAUDE_DOOR_CLASSIFIER      (0.5.0)                      the coop model the classifier call asks (it must be loaded), default the router's target; off = no classifier call
 // ANTHROPIC_API_KEY, when set, is the API key.
 
 import fs from 'node:fs'
@@ -215,7 +216,7 @@ export const askOllama = async (model, content, { system = '', timeoutMs = 10 * 
 // switching thinking off makes glm write its reasoning INTO the answer
 // (measured 17 Oct 2026) — so thinking stays on and the budget is large.
 
-export const askOpenAI = async (model, content, { system = '', timeoutMs = 10 * 60 * 1000, maxTokens = 0 } = {}) => {
+export const askOpenAI = async (model, content, { system = '', timeoutMs = 10 * 60 * 1000, maxTokens = 0, temperature = 0.2 } = {}) => {
   const name = model.slice('openai:'.length)
   const spec = setting(['CLAUDE_DOOR_OPENAI_URL'], 'dnssd:coop._openai._tcp.names.private.fish')
   let url = spec
@@ -227,7 +228,7 @@ export const askOpenAI = async (model, content, { system = '', timeoutMs = 10 * 
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       // the answer AND the thinking come out of max_tokens: a redraft of a long plan needs more than 8000 (0.2.1)
-      body: JSON.stringify({ model: name, messages, temperature: 0.2, max_tokens: maxTokens || +setting(['CLAUDE_DOOR_MAX_TOKENS'], '8000') || 8000 }),
+      body: JSON.stringify({ model: name, messages, temperature, max_tokens: maxTokens || +setting(['CLAUDE_DOOR_MAX_TOKENS'], '8000') || 8000 }),
       signal: AbortSignal.timeout(timeoutMs),
     })
   } catch (e) {
@@ -529,6 +530,91 @@ export const autoModel = ({ tier = 'light', need = 0, doors = [], answer = AUTO_
   if (m) return pick(m, 'light', join(router ? `${shortModel(router.id)} cannot hold it` : '', m.loaded ? '' : 'cold — it loads first'))
   const why = coopDoor.error || !coop.length ? `the coop did not answer (${coopDoor.error || 'no models'})` : 'no coop model holds it'
   return holds(claudeModel) ? pick(claudeModel, 'big', why) : { model: '', tier: 'light', asked: tier, note: `${why}, and it is too big for Claude's window as well` }
+}
+
+// ---------- the classifier call (0.5.0) ----------
+//
+// The deterministic rule (autoTier in the Plan Tool, voiceTier in the Voice
+// Tool) reads sizes and counts the farm already has. The classifier call reads
+// a short SUMMARY of the run — its kind, its measures, the questions going
+// in, the plan's opening — on a coop model that is already loaded, and says
+// light or big with a reason, before the real call. Its tokens are spent on
+// the coop (Auto Model Plan, Phase 6: assume it is worth them, measure in
+// Phase 7). It never cold-starts a model for a classification: no coop model
+// loaded, the coop down, a timeout, or an answer that is neither word, and it
+// returns tier null with `skipped` saying why, so the rule stands. Pure
+// enough to test: `doors` and `asker` can be given.
+
+export const CLASSIFIER_SYSTEM =
+  'You sort one run of a federated wiki Plan Tool into a tier before it is sent to a language model. ' +
+  'The runs: Revise Plan redrafts one plan page from the answers to its questions; Do Next Phase writes a report on one phase; ' +
+  'Revise Site revises every page of a site; Go Ahead amends, rewrites or newly writes one page. ' +
+  'Two tiers. big: a long question (over 48k tokens); four or more answered questions to weave in; a whole site (Revise Site); ' +
+  'Go Ahead with the action Rewrite, or on the plan itself; or a Revise Plan whose answers reach into many open phases (about twelve: answers plus half the open phases plus the questions asked back). ' +
+  'light: everything smaller — a Revise Plan of a plan with few answers and few open phases, however many phases it has; an amendment; a small new page; the next phase of a plan. ' +
+  'An ordinary Revise Plan is light: redrafting the plan page is what every Revise Plan does, not a reason for big. ' +
+  'Read the summary and answer with exactly one line, "light: reason" or "big: reason", the reason under twenty words. No other words.'
+export const CLASSIFIER_TIMEOUT_MS = 20 * 1000 // median 2.3 s, p90 7 s on the coop; a summary that sets the model ruminating is cut here and the rule stands
+export const CLASSIFIER_MAX_TOKENS = 6000 // a reasoning model thinks first (glm: ~250 tokens, once in 29 past 2500), then one line; the timeout is the real bound
+
+/** The one line a classifier answers, read: {tier: 'light'|'big'|null, reason, raw}. */
+export const parseTier = text => {
+  const s = String(text || '')
+    .split('</think>')
+    .pop()
+    .replace(/^[\s*_`#>"'-]+/, '')
+    .trim()
+  const m = s.match(/^(light|big)\b[\s*_`"':：—–-]*([^\n]*)/i)
+  if (!m) return { tier: null, reason: '', raw: s.slice(0, 200) }
+  return { tier: m[1].toLowerCase(), reason: m[2].replace(/[*_`"']+$/, '').trim().slice(0, 200), raw: s.slice(0, 200) }
+}
+
+/** The loaded coop model a classification goes to, or null with no cold start: a named one (CLAUDE_DOOR_CLASSIFIER) if loaded, else the router's loaded target, else any loaded text model, a plain one before a reasoning one. */
+export const classifierModel = (doors = [], want = '') => {
+  const name = want || setting(['CLAUDE_DOOR_CLASSIFIER'], '')
+  if (name === 'off') return null
+  const coop = (doors.find(d => d.door === 'openai') || { models: [] }).models
+  if (name) {
+    const m = coop.find(x => x.id === name || x.id === `openai:${name}` || x.id === `openai:llm_${name}`)
+    return m && m.loaded === true ? m : null
+  }
+  const router = coop.find(m => m.selector && m.routesTo)
+  const target = router && coop.find(m => m.id === router.routesTo)
+  if (target && target.loaded === true) return target
+  return coop.filter(m => !m.selector && m.loaded === true && !/vision/.test(m.id)).sort((a, b) => (a.reasoning === true) - (b.reasoning === true))[0] || null
+}
+
+/**
+ * The classifier's tier for a run: {tier, reason, model, ms, usage}, or
+ * {tier: null, skipped, model?, ms} when it did not decide. Never throws.
+ */
+export const classifyTier = async ({ summary = '', doors = null, model = '', timeoutMs = CLASSIFIER_TIMEOUT_MS, maxTokens = CLASSIFIER_MAX_TOKENS, asker = askOpenAI } = {}) => {
+  const t0 = Date.now()
+  const ms = () => Date.now() - t0
+  if (!model && setting(['CLAUDE_DOOR_CLASSIFIER'], '') === 'off') return { tier: null, skipped: 'CLAUDE_DOOR_CLASSIFIER is off', ms: 0 }
+  if (!String(summary).trim()) return { tier: null, skipped: 'no summary of the run to read', ms: 0 }
+  let list = doors
+  if (!list) {
+    try {
+      list = (await listModels()).doors
+    } catch (e) {
+      return { tier: null, skipped: `the doors could not be listed: ${e.message}`, ms: ms() }
+    }
+  }
+  const m = classifierModel(list, model)
+  if (!m) {
+    const coop = list.find(d => d.door === 'openai') || {}
+    const want = model || setting(['CLAUDE_DOOR_CLASSIFIER'], '')
+    return { tier: null, skipped: coop.error ? `the coop did not answer (${coop.error})` : want ? `${want} is not loaded on the coop` : 'no coop model is loaded', ms: ms() }
+  }
+  try {
+    const out = await asker(m.id, `Summary of the run:\n\n${String(summary).slice(0, 12000)}`, { system: CLASSIFIER_SYSTEM, timeoutMs, maxTokens, temperature: 0 }) // the same summary, the same word
+    const p = parseTier(out.markdown)
+    if (!p.tier) return { tier: null, model: out.model || m.id, skipped: `the classifier said neither light nor big: ${p.raw}`, ms: ms(), usage: out.usage }
+    return { tier: p.tier, reason: p.reason, model: out.model || m.id, ms: ms(), usage: out.usage }
+  } catch (e) {
+    return { tier: null, model: m.id, skipped: `the classifier call failed: ${e.message}`, ms: ms() }
+  }
 }
 
 export { discover }
