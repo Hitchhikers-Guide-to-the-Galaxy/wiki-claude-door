@@ -35,8 +35,17 @@ Read when a question is asked. Each `CLAUDE_DOOR_*` name falls back to the `AUDI
 | CLAUDE_DOOR_KEY_FILE | | the API key file, default ~/.config/voice/anthropic-key |
 | CLAUDE_DOOR_SCOPE_MEMORY | | the CLI's own memory cap: unset means 1G under a systemd unit on Linux and none elsewhere; a size such as 800M means always; off means never |
 | CLAUDE_DOOR_SYSTEMD_RUN | | the systemd-run executable |
+| CLAUDE_DOOR_OPENAI_URL | | an OpenAI-compatible endpoint (the coop), a URL or `dnssd:` spec, default `dnssd:coop._openai._tcp.names.private.fish` |
+| CLAUDE_DOOR_MAX_TOKENS | | an OpenAI-compatible answer's budget when the caller names none, default 8000; reasoning counts against it |
+| CLAUDE_DOOR_OLLAMA_NUM_CTX | | the largest context an Ollama question is given, default 32768 |
 
 `ANTHROPIC_API_KEY`, when set, is the API key.
+
+## Context and room to answer (0.2.1)
+
+Ollama answers with its own small default context unless told, and drops the start of a longer prompt silently, so every Ollama question now names `num_ctx`: the question's estimated tokens plus 4096 to answer in, at least 4096, at most `CLAUDE_DOOR_OLLAMA_NUM_CTX`. An OpenAI-compatible question takes `maxTokens` (reasoning models think out of the same budget), and an answer cut off by that budget (`finish_reason: length`) fails rather than passing as a short answer.
+
+`listModels()` asks each door, live and briefly, what it reaches: the Claude models, the endpoint's `llm_*` text models with their context windows, loaded state and reasoning, and the Ollama models; a router such as `llm_auto-big` reports the model it would route to now. `contextOf(model)` is that window, or null. `estimateTokens(text)` is about 3.5 characters a token.
 
 ## Research tools
 
@@ -48,7 +57,7 @@ Since 0.1.1, on a farm run by systemd (the Pi5), `claude -p` starts through `sys
 
 ## Status
 
-0.1.2, ESM, Node 22.12 or later (CommonJS callers `require()` it). Installed beside its callers as `"@fortyfoxes/wiki-claude-door": "file:../wiki-claude-door"`; Phase 6 of the Plan Tool Plan publishes it to npm, after which the callers depend on the published version.
+0.2.1, ESM, Node 22.12 or later (CommonJS callers `require()` it). Installed beside its callers as `"@fortyfoxes/wiki-claude-door": "file:../wiki-claude-door"`; Phase 6 of the Plan Tool Plan publishes it to npm, after which the callers depend on the published version.
 
 `npm test` runs the tests: filling, routing, settings, DNS-SD parsing, and the CLI road against a stand-in `claude`.
 

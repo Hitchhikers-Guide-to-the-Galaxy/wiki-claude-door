@@ -195,3 +195,67 @@ test('openai: model ids are accepted (0.2.0)', () => {
   assert.ok(isModelId('openai:llm_auto-big'))
   assert.ok(!isModelId('openai:'))
 })
+
+// 0.2.1: Ollama is told how much context the question needs, and an
+// OpenAI-compatible endpoint how much room to answer in — both against a
+// stand-in server on this machine.
+import http from 'node:http'
+import { estimateTokens, ollamaContext, askOllama, askOpenAI } from '../index.js'
+
+const standIn = answer =>
+  new Promise(resolve => {
+    const seen = []
+    const server = http.createServer((req, res) => {
+      let body = ''
+      req.on('data', c => (body += c))
+      req.on('end', () => {
+        seen.push({ url: req.url, body: JSON.parse(body || '{}') })
+        res.setHeader('Content-Type', 'application/json')
+        res.end(JSON.stringify(answer(req.url)))
+      })
+    })
+    server.listen(0, '127.0.0.1', () => resolve({ url: `http://127.0.0.1:${server.address().port}`, seen, close: () => server.close() }))
+  })
+
+test('ollamaContext: at least 4096, the question plus room to answer, at most CLAUDE_DOOR_OLLAMA_NUM_CTX', () => {
+  assert.equal(estimateTokens('x'.repeat(35)), 10)
+  assert.equal(ollamaContext('', '', 0), 4096)
+  assert.equal(ollamaContext('short'), 2 + 4096)
+  assert.equal(ollamaContext('x'.repeat(35000)), 10000 + 4096)
+  assert.equal(ollamaContext('x'.repeat(1000000)), 32768)
+  process.env.CLAUDE_DOOR_OLLAMA_NUM_CTX = '16384'
+  try {
+    assert.equal(ollamaContext('x'.repeat(1000000)), 16384)
+  } finally {
+    delete process.env.CLAUDE_DOOR_OLLAMA_NUM_CTX
+  }
+})
+
+test('askOllama names num_ctx, so a long plan is not silently cut from the front', async () => {
+  const s = await standIn(() => ({ message: { content: 'ok' }, done_reason: 'stop' }))
+  process.env.CLAUDE_DOOR_OLLAMA_URL = s.url
+  try {
+    await askOllama('ollama:qwen3:4b', 'x'.repeat(70000), { system: 'sys' })
+    assert.equal(s.seen[0].body.options.num_ctx, 20000 + 1 + 4096)
+  } finally {
+    delete process.env.CLAUDE_DOOR_OLLAMA_URL
+    s.close()
+  }
+})
+
+test('askOpenAI: maxTokens is the budget; an answer cut by length is a failure, not a short plan', async () => {
+  let reason = 'stop'
+  const s = await standIn(() => ({ model: 'm', choices: [{ message: { content: 'answer' }, finish_reason: reason }], usage: {} }))
+  process.env.CLAUDE_DOOR_OPENAI_URL = s.url
+  try {
+    await askOpenAI('openai:m', 'q', { maxTokens: 32000 })
+    assert.equal(s.seen[0].body.max_tokens, 32000)
+    await askOpenAI('openai:m', 'q')
+    assert.equal(s.seen[1].body.max_tokens, 8000)
+    reason = 'length'
+    await assert.rejects(askOpenAI('openai:m', 'q'), /ran out of room/)
+  } finally {
+    delete process.env.CLAUDE_DOOR_OPENAI_URL
+    s.close()
+  }
+})

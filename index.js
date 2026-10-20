@@ -161,6 +161,23 @@ export const askClaude = async (model, content, { system = '', timeoutMs = DEFAU
   }
 }
 
+// ---------- how big a question is (0.2.1) ----------
+//
+// About 3.5 characters a token for English markdown: an estimate, used to
+// size an Ollama context and to refuse a question a model cannot hold, never
+// to bill anything.
+export const estimateTokens = text => Math.ceil(String(text || '').length / 3.5)
+
+// Ollama answers with its own small default context (2048–4096 tokens) unless
+// told otherwise, and drops the START of a longer prompt without a word — a
+// plan's context is often ~30k tokens. So every call names num_ctx: the
+// question plus room to answer, at least 4096, at most CLAUDE_DOOR_OLLAMA_NUM_CTX
+// (default 32768, which qwen3 holds).
+export const ollamaContext = (content, system = '', answer = 4096) => {
+  const most = +setting(['CLAUDE_DOOR_OLLAMA_NUM_CTX'], '32768') || 32768
+  return Math.min(most, Math.max(4096, estimateTokens(system) + estimateTokens(content) + answer))
+}
+
 export const askOllama = async (model, content, { system = '', timeoutMs = 10 * 60 * 1000 } = {}) => {
   const name = model.slice('ollama:'.length)
   // found by name (qwen lives on the MacMini, never hard-coded), localhost when DNS-SD fails (0.2.0)
@@ -173,7 +190,7 @@ export const askOllama = async (model, content, { system = '', timeoutMs = 10 * 
     res = await fetch(`${url}/api/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: name, stream: false, messages }),
+      body: JSON.stringify({ model: name, stream: false, messages, options: { num_ctx: ollamaContext(content, system) } }),
       signal: AbortSignal.timeout(timeoutMs),
     })
   } catch (e) {
@@ -196,7 +213,7 @@ export const askOllama = async (model, content, { system = '', timeoutMs = 10 * 
 // switching thinking off makes glm write its reasoning INTO the answer
 // (measured 17 Oct 2026) — so thinking stays on and the budget is large.
 
-export const askOpenAI = async (model, content, { system = '', timeoutMs = 10 * 60 * 1000 } = {}) => {
+export const askOpenAI = async (model, content, { system = '', timeoutMs = 10 * 60 * 1000, maxTokens = 0 } = {}) => {
   const name = model.slice('openai:'.length)
   const spec = setting(['CLAUDE_DOOR_OPENAI_URL'], 'dnssd:coop._openai._tcp.names.private.fish')
   let url = spec
@@ -207,7 +224,8 @@ export const askOpenAI = async (model, content, { system = '', timeoutMs = 10 * 
     res = await fetch(`${url}/v1/chat/completions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: name, messages, temperature: 0.2, max_tokens: 8000 }),
+      // the answer AND the thinking come out of max_tokens: a redraft of a long plan needs more than 8000 (0.2.1)
+      body: JSON.stringify({ model: name, messages, temperature: 0.2, max_tokens: maxTokens || +setting(['CLAUDE_DOOR_MAX_TOKENS'], '8000') || 8000 }),
       signal: AbortSignal.timeout(timeoutMs),
     })
   } catch (e) {
@@ -220,6 +238,7 @@ export const askOpenAI = async (model, content, { system = '', timeoutMs = 10 * 
   const choice = body.choices?.[0] || {}
   const markdown = String(choice.message?.content || '').split('</think>').pop().trim()
   if (!markdown) throw unreachable(502, `${name} gave no answer (${choice.finish_reason || 'empty'})`)
+  if (choice.finish_reason === 'length') throw problem(502, `${name} ran out of room before it finished (max_tokens ${maxTokens || setting(['CLAUDE_DOOR_MAX_TOKENS'], '8000')}): the answer was cut short`)
   return {
     markdown,
     model: `openai:${body.model || name}`,
@@ -370,6 +389,85 @@ export const ask = async (model, content, opts = {}) => {
       ? await askClaudeCli(how, content, opts)
       : await askClaude(how, content, opts)
   return { ...out, ms: Date.now() - t0 }
+}
+
+// ---------- what each door can reach, now (0.2.1) ----------
+//
+// For a settings page: the Claude models this farm reaches (by its API key or
+// the CLI's login), the OpenAI-compatible endpoint's text models (the coop:
+// context window, loaded or cold, reasoning) and the Ollama models. Each door
+// is asked live, briefly; a door that does not answer is listed with why.
+// Remembered for a minute, so a page that asks twice asks once.
+let listed = null
+export const listModels = async ({ timeoutMs = 4000, fresh = false } = {}) => {
+  if (!fresh && listed && Date.now() - listed.at < 60 * 1000) return listed.value
+  const get = async (url) => {
+    const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) })
+    if (!res.ok) throw new Error(`${url} answered ${res.status}`)
+    return res.json()
+  }
+  const claude = {
+    door: 'claude',
+    route: hasApiKey() ? 'the Claude API, by this farm\'s key' : 'the Claude Code CLI, on the login of the machine the farm runs on',
+    models: [['claude-opus-5-5', 'Claude Opus 5.5'], ['claude-sonnet-5-5', 'Claude Sonnet 5.5'], ['claude-haiku-5-5', 'Claude Haiku 5.5']].map(([id, name]) => ({ id, name, contextLength: 200000, tools: true })),
+  }
+  const openai = { door: 'openai', models: [] }
+  try {
+    const spec = setting(['CLAUDE_DOOR_OPENAI_URL'], 'dnssd:coop._openai._tcp.names.private.fish')
+    const url = (await discover.resolve(spec, setting(['CLAUDE_DOOR_OPENAI_FALLBACK'], ''))).replace(/\/v1$/, '')
+    openai.url = url
+    const body = await get(`${url}/v1/models`)
+    openai.models = (body.data || [])
+      .filter(m => /^llm_/.test(m.id))
+      .map(m => {
+        const swap = m.meta?.llamaswap || {}
+        return {
+          id: `openai:${m.id}`,
+          name: m.name || m.id,
+          description: m.description || '',
+          contextLength: m.context_length || m.context_window || null,
+          selector: swap.type === 'selector',
+          targets: swap.targets || [],
+          reasoning: !!swap.reasoning,
+          loaded: m.status?.value === 'loaded',
+        }
+      })
+  } catch (e) {
+    openai.error = e.message
+  }
+  const ollama = { door: 'ollama', models: [] }
+  try {
+    const spec = setting(['CLAUDE_DOOR_OLLAMA_URL', 'AUDIONOTE_OLLAMA_URL'], 'dnssd:qwen._ollama._tcp.names.private.fish')
+    const url = await discover.resolve(spec, setting(['CLAUDE_DOOR_OLLAMA_FALLBACK', 'AUDIONOTE_OLLAMA_FALLBACK'], 'http://127.0.0.1:11434'))
+    ollama.url = url
+    const body = await get(`${url}/api/tags`)
+    const most = +setting(['CLAUDE_DOOR_OLLAMA_NUM_CTX'], '32768') || 32768
+    ollama.models = (body.models || []).map(m => ({ id: `ollama:${m.name}`, name: m.name, size: m.size, contextLength: most }))
+  } catch (e) {
+    ollama.error = e.message
+  }
+  // A selector (llm_auto-big: "whichever big model is already loaded") routes
+  // to a loaded target when there is one, so its window is that target's now;
+  // with none loaded it cold-starts the first, and promises only the smallest.
+  for (const m of openai.models.filter(x => x.selector)) {
+    const targets = m.targets.map(t => openai.models.find(x => x.id === `openai:${t}`)).filter(Boolean)
+    const warm = targets.find(t => t.loaded)
+    m.routesTo = warm ? warm.id : targets[0]?.id || null
+    const windows = targets.map(t => t.contextLength).filter(Boolean)
+    m.contextLength = warm?.contextLength || (windows.length ? Math.min(...windows) : null)
+  }
+  listed = { at: Date.now(), value: { doors: [openai, claude, ollama] } }
+  return listed.value
+}
+
+/** A model's context window, if a door says (null when unknown). */
+export const contextOf = async model => {
+  const { doors } = await listModels()
+  for (const d of doors) {
+    const m = d.models.find(x => x.id === model || `claude-cli:${x.id}` === model)
+    if (m) return m.contextLength || null
+  }
+  return null
 }
 
 export { discover }
