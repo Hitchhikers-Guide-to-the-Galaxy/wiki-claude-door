@@ -37,6 +37,7 @@
 //   CLAUDE_DOOR_AUTO_LIGHT      (0.4.0)                      the coop model Auto's light tier asks, default openai:llm_auto-big
 //   CLAUDE_DOOR_AUTO_BIG        (0.4.0)                      the Claude model Auto's big tier asks, default claude-fable-5-1
 //   CLAUDE_DOOR_CLASSIFIER      (0.5.0)                      the coop model the classifier call asks (it must be loaded), default the router's target; off = no classifier call
+//   CLAUDE_DOOR_REASONING_EFFORT (0.5.2)                     reasoning_effort sent to openai: models (low, medium, high…), default low; off = not sent
 // ANTHROPIC_API_KEY, when set, is the API key.
 
 import fs from 'node:fs'
@@ -55,6 +56,17 @@ const setting = (names, fallback = '') => {
 
 const problem = (status, message, extra = {}) => Object.assign(new Error(message), { status, ...extra })
 const unreachable = (status, message) => problem(status, message, { unreachable: true })
+
+/**
+ * Why a fetch failed, with undici's cause: "fetch failed" alone hides it
+ * (0.5.1). UND_ERR_HEADERS_TIMEOUT means the server took the request but sent
+ * no headers within 300 s, which is not the same as an unreachable server.
+ */
+export const fetchFailure = e => {
+  const c = e && e.cause
+  const why = c ? [c.code || c.name, c.message].filter(Boolean).join(': ') : ''
+  return `${e && e.message ? e.message : String(e)}${why ? ` (${why})` : ''}`
+}
 
 // ---------- which model ----------
 
@@ -197,7 +209,7 @@ export const askOllama = async (model, content, { system = '', timeoutMs = 10 * 
       signal: AbortSignal.timeout(timeoutMs),
     })
   } catch (e) {
-    throw unreachable(502, `Ollama at ${url} could not be reached: ${e.message}`)
+    throw unreachable(502, `Ollama at ${url} could not be reached: ${fetchFailure(e)}`)
   }
   if (!res.ok) throw Object.assign(problem(502, `Ollama answered ${res.status}: ${(await res.text()).slice(0, 200)}`), { unreachable: res.status === 404 })
   const body = await res.json()
@@ -215,10 +227,72 @@ export const askOllama = async (model, content, { system = '', timeoutMs = 10 * 
 // message.reasoning: with a small max_tokens the answer comes back empty, and
 // switching thinking off makes glm write its reasoning INTO the answer
 // (measured 17 Oct 2026) — so thinking stays on and the budget is large.
+//
+// The answer is STREAMED (0.5.1). Asked for in one piece, the server sends no
+// headers until the whole answer is written, and Node's fetch (undici) gives
+// up after 300 s without headers, whatever the AbortSignal says: a coop
+// Revise Plan of an 80 kB plan died at 301.8 s as "fetch failed" (21 Oct
+// 2026, UND_ERR_HEADERS_TIMEOUT). A stream sends headers at once and a chunk
+// per token, so timeoutMs (10 min) is the only limit on the whole read.
 
-export const askOpenAI = async (model, content, { system = '', timeoutMs = 10 * 60 * 1000, maxTokens = 0, temperature = 0.2 } = {}) => {
+/**
+ * Read an OpenAI-style SSE stream into one answer:
+ * {content, reasoning, finish, model, usage}. Reasoning deltas are counted
+ * but not kept in the answer.
+ */
+export const readChatStream = async body => {
+  const out = { content: '', reasoning: 0, finish: null, model: '', usage: null }
+  const decoder = new TextDecoder()
+  let buffer = ''
+  const take = line => {
+    if (!line.startsWith('data:')) return
+    const data = line.slice(5).trim()
+    if (!data || data === '[DONE]') return
+    let chunk
+    try {
+      chunk = JSON.parse(data)
+    } catch (_) {
+      return
+    }
+    if (chunk.error) throw problem(502, `the stream reported an error: ${String(chunk.error.message || JSON.stringify(chunk.error)).slice(0, 200)}`)
+    if (chunk.model) out.model = chunk.model
+    if (chunk.usage) out.usage = chunk.usage
+    const choice = chunk.choices?.[0]
+    if (!choice) return
+    const delta = choice.delta || choice.message || {}
+    if (delta.content) out.content += delta.content
+    const thought = delta.reasoning || delta.reasoning_content
+    if (thought) out.reasoning += thought.length
+    if (choice.finish_reason) out.finish = choice.finish_reason
+  }
+  for await (const piece of body) {
+    buffer += decoder.decode(piece, { stream: true })
+    let nl
+    while ((nl = buffer.indexOf('\n')) !== -1) {
+      take(buffer.slice(0, nl).replace(/\r$/, ''))
+      buffer = buffer.slice(nl + 1)
+    }
+  }
+  buffer += decoder.decode()
+  if (buffer) take(buffer.replace(/\r$/, ''))
+  return out
+}
+
+// reasoning_effort (0.5.2): left to itself glm-5.3-flash spent all 32,000
+// tokens of a Revise Plan thinking and wrote nothing (21 Oct 2026, 345 s).
+// The coop accepts low/medium/high; on a small redraft low thought for 8
+// tokens where the default thought for 425. Default low; off sends none.
+export const reasoningEffort = (asked = '') => {
+  const v = String(asked || setting(['CLAUDE_DOOR_REASONING_EFFORT'], 'low')).trim().toLowerCase()
+  return !v || v === 'off' || v === 'none' || v === 'default' ? null : v
+}
+
+export const askOpenAI = async (model, content, { system = '', timeoutMs = 10 * 60 * 1000, maxTokens = 0, temperature = 0.2, effort = '' } = {}) => {
   const name = model.slice('openai:'.length)
   const spec = setting(['CLAUDE_DOOR_OPENAI_URL'], 'dnssd:coop._openai._tcp.names.private.fish')
+  const budget = maxTokens || +setting(['CLAUDE_DOOR_MAX_TOKENS'], '8000') || 8000
+  const thinking = reasoningEffort(effort)
+  const started = Date.now()
   let url = spec
   let res
   try {
@@ -226,27 +300,46 @@ export const askOpenAI = async (model, content, { system = '', timeoutMs = 10 * 
     const messages = [...(system ? [{ role: 'system', content: system }] : []), { role: 'user', content }]
     res = await fetch(`${url}/v1/chat/completions`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
       // the answer AND the thinking come out of max_tokens: a redraft of a long plan needs more than 8000 (0.2.1)
-      body: JSON.stringify({ model: name, messages, temperature, max_tokens: maxTokens || +setting(['CLAUDE_DOOR_MAX_TOKENS'], '8000') || 8000 }),
+      body: JSON.stringify({ model: name, messages, temperature, max_tokens: budget, ...(thinking ? { reasoning_effort: thinking } : {}), stream: true, stream_options: { include_usage: true } }),
       signal: AbortSignal.timeout(timeoutMs),
     })
   } catch (e) {
-    throw unreachable(502, `the model at ${url} could not be reached: ${e.message}`)
+    throw unreachable(502, `the model at ${url} could not be reached: ${fetchFailure(e)}`)
   }
   if (!res.ok) {
     throw Object.assign(problem(502, `${url} answered ${res.status}: ${(await res.text()).slice(0, 200)}`), { unreachable: res.status >= 500 || res.status === 404 })
   }
-  const body = await res.json()
-  const choice = body.choices?.[0] || {}
-  const markdown = String(choice.message?.content || '').split('</think>').pop().trim()
-  if (!markdown) throw unreachable(502, `${name} gave no answer (${choice.finish_reason || 'empty'})`)
-  if (choice.finish_reason === 'length') throw problem(502, `${name} ran out of room before it finished (max_tokens ${maxTokens || setting(['CLAUDE_DOOR_MAX_TOKENS'], '8000')}): the answer was cut short`)
+  let got
+  try {
+    if (/text\/event-stream/i.test(res.headers.get('content-type') || '')) {
+      got = await readChatStream(res.body)
+    } else {
+      // a server that ignores stream: true answers in one piece, as before 0.5.1
+      const body = await res.json()
+      const choice = body.choices?.[0] || {}
+      got = { content: String(choice.message?.content || ''), reasoning: String(choice.message?.reasoning || choice.message?.reasoning_content || '').length, finish: choice.finish_reason, model: body.model, usage: body.usage }
+    }
+  } catch (e) {
+    if (e.status) throw e
+    const secs = Math.round((Date.now() - started) / 1000)
+    throw unreachable(502, `the answer from ${url} stopped after ${secs}s: ${fetchFailure(e)}`)
+  }
+  const markdown = String(got.content || '').split('</think>').pop().trim()
+  const effortNote = `reasoning_effort ${thinking || 'not sent'}`
+  if (!markdown && got.finish === 'length') {
+    // the whole budget went on thinking: say so, not "no answer" (0.5.2)
+    const thought = got.usage?.completion_tokens_details?.reasoning_tokens
+    throw unreachable(502, `${name} spent all ${budget} max_tokens reasoning (${thought ? `${thought} reasoning tokens` : `${got.reasoning || 0} characters of reasoning`}, ${effortNote}) and wrote no answer — lower CLAUDE_DOOR_REASONING_EFFORT or ask a Claude model`)
+  }
+  if (!markdown) throw unreachable(502, `${name} gave no answer (${got.finish || 'empty'})`)
+  if (got.finish === 'length') throw problem(502, `${name} ran out of room before it finished (max_tokens ${budget}, ${effortNote}): the answer was cut short`)
   return {
     markdown,
-    model: `openai:${body.model || name}`,
-    stop: choice.finish_reason,
-    usage: { input: body.usage?.prompt_tokens, output: body.usage?.completion_tokens, reasoning: body.usage?.completion_tokens_details?.reasoning_tokens },
+    model: `openai:${got.model || name}`,
+    stop: got.finish,
+    usage: { input: got.usage?.prompt_tokens, output: got.usage?.completion_tokens, reasoning: got.usage?.completion_tokens_details?.reasoning_tokens },
   }
 }
 
